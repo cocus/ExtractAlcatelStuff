@@ -244,6 +244,9 @@ cleanup_close:
 
 
 
+
+// See: https://www.3gpp.org/ftp/tsg_sa/TSG_SA/TSGS_10/Docs/PDF/SP-000690.pdf
+
 #include <pshpack1.h>
 typedef struct {
 	char magic[4]; // .SEQ
@@ -310,8 +313,148 @@ typedef struct {
 	uint8_t number_of_tracks;
 	uint8_t reserved2;
 } MSEQ_Header;
+
+
+
+typedef struct {
+	union {
+		uint8_t track_oc_copy_status;
+		struct {
+			uint8_t track : 5;				/// < SEQ command « Track ». This command opens and closes a track content.
+			uint8_t oc : 1;					/// < value 0 means that this track command is applied for track opening. Value 1 is used for closing a track.
+			uint8_t track_copy_status : 2;	/// < ets the copying permission of the track content. Only valid if TRK_COPY_STATUS=%10 in MSEQ header. If not, refer to global permission set in MSEQ header.
+		};
+	};
+
+	uint8_t track_number;	/// < number that identifies the track (track ID). The Track numbers are attributed by the MSEQ builder software, from track 1 to track n (maximum 255 tracks in one MSEQ file). Value 0 is reserved (see §3.2.5). If this command is used for closing a track, then the ID of the track is mentioned.
+
+	union {
+		uint8_t track_type_subtype;
+		struct {
+			uint8_t track_type : 6;		/// < this indicates which type of data is included in that track. So if a player or processor is not involved in that type of content, it can read the length of track and jump to read the type of the next track.
+			uint8_t track_sub_type : 2;	/// < defines, for a track type, a particular implementation of this format. This indication is for information only, and must not be used for format decoding.
+		};
+	};
+
+	uint8_t track_length_lsb;	/// < number of 16-bit words in track. It includes the « opening » TRACK command (3 words) and the « closing » track command (1 word).
+	uint16_t track_length_msb;
+	uint16_t reserved;
+} MSEQ_Track_Header;
+
+
+typedef struct {
+	union {
+		uint8_t track_oc;
+		struct {
+			uint8_t track : 5;
+			uint8_t oc : 1;
+			uint8_t reserved : 2;
+		};
+	};
+
+	uint8_t track_number;
+} MSEQ_Track_End;
+
+
+typedef struct {
+	union {
+
+		struct {
+			union {
+				uint8_t lsb;
+				struct {
+					uint8_t cmd : 5;
+					uint8_t who_knows : 3;
+				};
+			};
+			uint8_t msb;
+		};
+
+		uint16_t word;
+
+	};
+
+} MSEQ_Command_or_something;
+
+
+
+typedef struct {
+	union {
+		uint16_t first_word;
+		struct {
+			uint8_t note : 5;			/// < NOTE command
+			uint8_t channel : 4;		/// < sound channel, from 0 to 15. Most of the time, a single instrument is associated with a channel number. The definition is the same than in MIDI format.
+			uint8_t note_number : 7;	/// < this is the note to be played. Definition is the same than in MIDI format (Middle C of an 88 note piano-style keyboard has a reference value of 60).
+		};
+	};
+
+	union {
+		uint16_t second_word;
+		struct {
+			uint8_t velocity : 6;		/// < this is the volume of the note to be played. Definition is the same than in MIDI format, excepted that the range is reduced to 0-63.
+			uint16_t running_time : 10;	/// < defines the length of time the note has to be played. The note will sound during RUNNING_TIME x RTB x ATB (in µS).
+		};
+	};
+} MSEQ_Command_RelativeTimeBase;
 #include <poppack.h>
 
+
+typedef enum {
+	TMODE_MULTIPROCESSORS = 0,	/// < multiprocessors oriented, no streaming (default) : tracks are Sequentially defined
+	TMODE_STREAMING = 1,		/// < streaming oriented : only one multi-purpose track is defined
+	TMODE_PACKET = 2,			/// < packet oriented (streaming + multiprocessors) : tracks are Sequentially defined within packets
+	TMODE_RESERVED = 3,			/// < reserved for future use
+} MSEQ_Header_TMode;
+
+typedef enum {
+	SEQ_COPY_STATUS_PROHIBITED = 0,		/// < global copy prohibited. None of the contents can be copied. (in definition of each track, TRK_COPY_STATUS = %10)
+	SEQ_COPY_STATUS_COUNTDOWN = 1,		/// < global copy restricted to copy countdown.
+	SEQ_COPY_STATUS_NOT_DEFINED = 2,	/// < global copy can not be defined. See each « track copy status » for track-content copy permission.
+	SEQ_COPY_STATUS_FREE = 3,			/// < all-tracks copy free. (in definition of each track, TRK_COPY_STATUS = %10)
+} MSEQ_Header_SEQ_Copy_Status;
+
+typedef enum {
+	LOOP_DEF_NOT_DEFINED = 0,
+	LOOP_DEF_DEFINED = 1,
+	LOOP_DEF_RESERVED = 2,
+	LOOP_DEF_INFINITE = 3,
+} MSEQ_Header_Loop_Def;
+
+
+typedef enum : char {
+	MSEQ_SHORT_TEXT = 0,
+	MSEQ_LONG_TEXT = 1,
+	MSEQ_NOTE = 2,
+	MSEQ_PROGRAM_CHANGE = 3,
+	MSEQ_VOLUME = 4,
+	MSEQ_SOUND_SPECIAL_EFFECT1 = 5,
+	MSEQ_SOUND_SPECIAL_EFFECT2 = 6,
+	MSEQ_VIDEO_CHANNEL_EFFECT = 7,
+	MSEQ_RESERVED_PICTURE_EFFECT = 8,
+	MSEQ_RESERVED_ANIM_EFFECT = 9,
+	MSEQ_TEXT_EFFECT = 0xa,
+	MSEQ_RESERVED1 = 0xb,
+	MSEQ_RESERVED2 = 0xc,
+	MSEQ_RESERVED3 = 0xd,
+	MSEQ_ANIMATION_DEFINITION = 0xe,
+	MSEQ_RESERVED4 = 0xf,
+	MSEQ_RESERVED5 = 0x10,
+	MSEQ_PICTURE_DEFINITION = 0x11,
+	MSEQ_RESERVED6 = 0x12,
+	MSEQ_VIDEO_ZONE = 0x13,
+	MSEQ_VIDEO_PROPERTIES = 0x14,
+	MSEQ_RESERVED7 = 0x15,
+	MSEQ_DELAY_DELTA_TIME = 0x16,
+	MSEQ_EXTENDED_DELAY = 0x17,
+	MSEQ_R_DELAY = 0x18,
+	MSEQ_SYNCHRO = 0x19,
+	MSEQ_RESERVED8 = 0x1a,
+	MSEQ_RELATIVE_TIME_BASE_DEFINITION = 0x1b,
+	MSEQ_BULK_DEFINITION = 0x1c,
+	MSEQ_USE_OBJECT = 0x1d,
+	MSEQ_TRACK_DEFINITION = 0x1e,
+	MSEQ_SYSTEM_COMMAND = 0x1f,
+} MSEQ_Command_Set;
 
 int ProcessSeq(const char* seq, const char* mid)
 {
@@ -324,7 +467,7 @@ int ProcessSeq(const char* seq, const char* mid)
 	MSEQ_Header hdr{ };
 
 
-	infile.read((char*) &hdr, sizeof(hdr));
+	infile.read((char*)&hdr, sizeof(hdr));
 
 
 	uint32_t LengthOfFile = hdr.len_msb;
@@ -334,7 +477,7 @@ int ProcessSeq(const char* seq, const char* mid)
 	uint32_t AbsoluteTimeBase = hdr.absolute_time_base_msb;
 	AbsoluteTimeBase <<= 16;
 	AbsoluteTimeBase |= hdr.absolute_time_base_lsb;
-	
+
 	printf("[DBG] sz %d, Magic '%c%c%c%c', LengthOfFile %d (0x%x), Tracks %d, TMode %d, EMS %d, SEQ Class %d, ATB %d (0x%x)\n",
 		sizeof(hdr),
 		hdr.magic[0], hdr.magic[1], hdr.magic[2], hdr.magic[3],
@@ -366,7 +509,75 @@ int ProcessSeq(const char* seq, const char* mid)
 
 	printf("[DBG] loop_point2 %d, loop_def2 %d, start_point2 %d, start_nb_repeat2 %d\n",
 		hdr.loop_point2, hdr.loop_def2, hdr.start_point2, hdr.start_nb_repeat2);*/
-		
+
+
+
+	bool track_open = false;
+	uint32_t track_length = 0;
+
+	while (1) {
+		MSEQ_Command_or_something gen_command{};
+		infile.read((char*)&gen_command, sizeof(gen_command));
+
+		switch (gen_command.cmd) {
+		case MSEQ_TRACK_DEFINITION:
+		{
+			MSEQ_Track_Header track_header{};
+			track_header.track_oc_copy_status = gen_command.lsb;
+			track_header.track_number = gen_command.msb;
+
+			infile.read((char*)&track_header.track_type_subtype, sizeof(track_header) - sizeof(gen_command));
+
+			if (track_open) {
+				printf("[ERR] opening a new track when one is already open!\n");
+				return -2;
+			}
+
+			track_length = track_header.track_length_msb;
+			track_length <<= 8;
+			track_length |= track_header.track_length_lsb;
+
+			printf("[DBG] cmd 0x%x, O/C %d, copy status %d, track number %d\n",
+				track_header.track, track_header.oc, track_header.track_copy_status, track_header.track_number);
+			printf("[DBG] Track sub type %d, Length of track %d word(s)\n", track_header.track_sub_type, track_length);
+
+
+			/*for (size_t seq_num = 0; seq_num < track_length; seq_num++) {
+				MSEQ_Command_or_something cmd{};
+				infile.read((char*)&cmd, sizeof(cmd));
+				printf("[DBG] cmd seq_num %d, kind %d\n", seq_num, cmd.cmd);
+			}
+
+			MSEQ_Track_End track_end{};
+			infile.read((char*)&track_header, sizeof(track_header));
+			*/
+			break;
+		} // MSEQ_TRACK_DEFINITION
+		case MSEQ_RELATIVE_TIME_BASE_DEFINITION:
+		{
+			MSEQ_Command_RelativeTimeBase rtb{};
+			rtb.first_word = gen_command.word;
+
+			infile.read((char*)&rtb.second_word, sizeof(rtb) - sizeof(gen_command));
+
+			printf("[DBG] CMD RTB, note %d, channel %d, velocity %d, running time %d\n", rtb.note_number, rtb.channel, rtb.velocity, rtb.running_time);
+			break;
+		} // MSEQ_RELATIVE_TIME_BASE_DEFINITION
+		default:
+			printf("[ERR] unhandled command %d\n", gen_command.cmd);
+			return -2;
+		}
+	}
+
+
+
+
+
+	/*
+
+	*/
+
+
 	infile.close();
 	outfile.close();
 
