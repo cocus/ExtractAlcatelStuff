@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <list>
 #include <Windows.h>
 #include <gdiplus.h>
 #include <filesystem>

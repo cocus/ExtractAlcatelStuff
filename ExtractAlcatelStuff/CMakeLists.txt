@@ -10,4 +10,4 @@ if (CMAKE_VERSION VERSION_GREATER 3.12)
 endif()
 
 # TODO: Agregue pruebas y destinos de instalación si es necesario.
-target_link_libraries(ExtractAlcatelStuff gdiplus.lib)
+#target_link_libraries(ExtractAlcatelStuff gdiplus.lib)

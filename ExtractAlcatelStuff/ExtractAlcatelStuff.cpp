@@ -315,69 +315,6 @@ typedef struct {
 } MSEQ_Header;
 
 
-
-typedef struct {
-	union {
-		uint8_t track_oc_copy_status;
-		struct {
-			uint8_t track : 5;				/// < SEQ command « Track ». This command opens and closes a track content.
-			uint8_t oc : 1;					/// < value 0 means that this track command is applied for track opening. Value 1 is used for closing a track.
-			uint8_t track_copy_status : 2;	/// < ets the copying permission of the track content. Only valid if TRK_COPY_STATUS=%10 in MSEQ header. If not, refer to global permission set in MSEQ header.
-		};
-	};
-
-	uint8_t track_number;	/// < number that identifies the track (track ID). The Track numbers are attributed by the MSEQ builder software, from track 1 to track n (maximum 255 tracks in one MSEQ file). Value 0 is reserved (see §3.2.5). If this command is used for closing a track, then the ID of the track is mentioned.
-
-	union {
-		uint8_t track_type_subtype;
-		struct {
-			uint8_t track_type : 6;		/// < this indicates which type of data is included in that track. So if a player or processor is not involved in that type of content, it can read the length of track and jump to read the type of the next track.
-			uint8_t track_sub_type : 2;	/// < defines, for a track type, a particular implementation of this format. This indication is for information only, and must not be used for format decoding.
-		};
-	};
-
-	uint8_t track_length_lsb;	/// < number of 16-bit words in track. It includes the « opening » TRACK command (3 words) and the « closing » track command (1 word).
-	uint16_t track_length_msb;
-	uint16_t reserved;
-} MSEQ_Track_Header;
-
-
-typedef struct {
-	union {
-		uint8_t track_oc;
-		struct {
-			uint8_t track : 5;
-			uint8_t oc : 1;
-			uint8_t reserved : 2;
-		};
-	};
-
-	uint8_t track_number;
-} MSEQ_Track_End;
-
-
-typedef struct {
-	union {
-
-		struct {
-			union {
-				uint8_t lsb;
-				struct {
-					uint8_t cmd : 5;
-					uint8_t who_knows : 3;
-				};
-			};
-			uint8_t msb;
-		};
-
-		uint16_t word;
-
-	};
-
-} MSEQ_Command_or_something;
-
-
-
 typedef struct {
 	union {
 		uint16_t first_word;
@@ -395,9 +332,8 @@ typedef struct {
 			uint16_t running_time : 10;	/// < defines the length of time the note has to be played. The note will sound during RUNNING_TIME x RTB x ATB (in µS).
 		};
 	};
-} MSEQ_Command_RelativeTimeBase;
+} MSEQ_Command_Note;
 #include <poppack.h>
-
 
 typedef enum {
 	TMODE_MULTIPROCESSORS = 0,	/// < multiprocessors oriented, no streaming (default) : tracks are Sequentially defined
@@ -420,6 +356,11 @@ typedef enum {
 	LOOP_DEF_INFINITE = 3,
 } MSEQ_Header_Loop_Def;
 
+typedef enum {
+	CMD_SYSTEM_TYPE_EOF = 0,				/// < This word is the last of the MSEQ file. It is put after the « Track (close) » command of the last defined track.
+	CMD_SYSTEM_TYPE_START_OF_PACKET = 1,	/// < Used in packed mode (T-MODE=2). The packet number are sequential and are modulo 256 (value 0 is reserved).
+	CMD_SYSTEM_TYPE_END_OF_PACKET = 2,		/// < Used in packed mode (T-MODE=2). Within a packet, the packet number is the same for STARTing command and ENDing command (value 0 is reserved).
+} MSEQ_CMD_System_Types;
 
 typedef enum : char {
 	MSEQ_SHORT_TEXT = 0,
@@ -455,6 +396,366 @@ typedef enum : char {
 	MSEQ_TRACK_DEFINITION = 0x1e,
 	MSEQ_SYSTEM_COMMAND = 0x1f,
 } MSEQ_Command_Set;
+
+class MSEQCmd {
+public:
+	virtual void FeedRemaining(void* const data, size_t sz) {};
+	virtual void Dump() const {};
+
+	MSEQ_Command_Set GetKind() const { return _kind; }
+	size_t GetRemainingSize() const { return _remaining; }
+	bool IsFull() const { return _remaining == 0; }
+	size_t Size() const { return _size; }
+
+	static MSEQ_Command_Set GetCmdFromFirstWord(const uint16_t first_word)
+	{
+		uint16_t cmd_bits = first_word & 0x1f;
+		return static_cast<MSEQ_Command_Set>(cmd_bits);
+	}
+protected:
+	MSEQCmd(const MSEQ_Command_Set kind, const size_t size = 2)
+		: _kind(kind), _size(size), _remaining(size - 2) { };
+
+	size_t _remaining{ 0 };
+
+private:
+	MSEQ_Command_Set _kind{};
+	size_t _size{ 1 };
+};
+
+class MSEQCmdTrackDefinition : public MSEQCmd {
+public:
+	MSEQCmdTrackDefinition(uint16_t first_word)
+		: MSEQCmd(MSEQ_TRACK_DEFINITION, 8)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_TRACK_DEFINITION) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_TRACK_DEFINITION);
+			_ASSERT(true);
+		}
+
+		_oc = first_word & 0x20 ? true : false;
+
+		if (_oc) {
+			// closing a track is a single command
+			_remaining = 0;
+		}
+		else {
+			_track_copy_status = (uint16_t)(first_word & 0x00c0) >> 6;
+		}
+
+		_track_number = (uint16_t)(first_word & 0xff00) >> 8;
+	}
+
+	void FeedRemaining(void* const data, size_t sz)
+	{
+		if (sz != _remaining) {
+			printf("[ERROR] sz %lld != _remaining %lld\n", sz, _remaining);
+			_ASSERT(true);
+			return;
+		}
+
+		uint16_t* words = (uint16_t*)data;
+		if (!words) {
+			printf("[ERROR] !data\n");
+			_ASSERT(true);
+			return;
+		}
+
+		_track_type = (uint16_t)(words[0] & 0x003f) >> 0;
+		_track_sub_type = (uint16_t)(words[0] & 0x00c0) >> 6;
+		_track_length_lsb = (uint16_t)(words[0] & 0xff00) >> 8;
+
+		_track_length_msb = words[1];
+
+		_reserved = words[2];
+
+		_remaining = 0;
+	}
+
+
+	void Dump() const {
+		if (_oc) {
+			printf("[DBG] CMD TrackHeader, Track %d, OC = close\n", _track_number);
+		}
+		else {
+			printf("[DBG] CMD TrackHeader, Track %d, OC = open, copy status %d, type %d, subtype %d, length %ld\n",
+				_track_number, _track_copy_status, _track_type, _track_sub_type, GetTrackLength());
+		}
+	}
+
+	bool GetOC() const { return _oc; } /// < value 0 means that this track command is applied for track opening. Value 1 is used for closing a track.
+	uint8_t GetTrackCopyStatus() const { return _track_copy_status; }
+	uint8_t GetTrackNumber() const { return _track_number; } /// < number that identifies the track (track ID). The Track numbers are attributed by the MSEQ builder software, from track 1 to track n (maximum 255 tracks in one MSEQ file). Value 0 is reserved (see §3.2.5). If this command is used for closing a track, then the ID of the track is mentioned.
+	uint8_t GetTrackType() const { return _track_type; } /// < this indicates which type of data is included in that track. So if a player or processor is not involved in that type of content, it can read the length of track and jump to read the type of the next track.
+	uint8_t GetTrackSubType() const { return _track_sub_type; } /// < defines, for a track type, a particular implementation of this format. This indication is for information only, and must not be used for format decoding.
+	uint32_t GetTrackLength() const /// < number of 16-bit words in track. It includes the « opening » TRACK command (3 words) and the « closing » track command (1 word).
+	{
+		uint32_t l = _track_length_msb;
+		l <<= 8;
+		l |= _track_length_lsb;
+		return l;
+	}
+
+private:
+	bool _oc{};
+	uint8_t _track_copy_status{};
+	uint8_t _track_number{};
+	uint8_t _track_type{};
+	uint8_t _track_sub_type{};
+	uint8_t _track_length_lsb{};
+	uint16_t _track_length_msb{};
+	uint16_t _reserved{};
+};
+
+class MSEQCmdNote: public MSEQCmd {
+public:
+	MSEQCmdNote(uint16_t first_word)
+		: MSEQCmd(MSEQ_NOTE, 4)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_NOTE) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_TRACK_DEFINITION);
+			_ASSERT(true);
+		}
+
+		_channel = (uint16_t)(first_word & 0x01e0) >> 5;
+		_note_number = (uint16_t)(first_word & 0xFE00) >> 9;
+	}
+
+	void FeedRemaining(void* const data, size_t sz)
+	{
+		if (sz != _remaining) {
+			printf("[ERROR] sz %lld != _remaining %lld\n", sz, _remaining);
+			_ASSERT(true);
+			return;
+		}
+
+		uint16_t* words = (uint16_t*)data;
+		if (!words) {
+			printf("[ERROR] !data\n");
+			_ASSERT(true);
+			return;
+		}
+
+		_velocity = (uint16_t)(words[0] & 0x003f) >> 0;
+		_running_time = (uint16_t)(words[0] & 0xFFC0) >> 6;
+
+		_remaining = 0;
+	}
+
+
+	void Dump() const {
+		printf("[DBG] CMD Note, channel %d, note %d, velocity %d, running time %d\n",
+			_channel, _note_number, _velocity, _running_time);
+	}
+
+	uint8_t GetChannel() const { return _channel; }				/// < sound channel, from 0 to 15. Most of the time, a single instrument is associated with a channel number. The definition is the same than in MIDI format.
+	uint8_t GetNoteNumber() const { return _note_number; }		/// < this is the note to be played. Definition is the same than in MIDI format (Middle C of an 88 note piano-style keyboard has a reference value of 60).
+	uint8_t GetVelocity() const { return _velocity; }			/// < this is the volume of the note to be played. Definition is the same than in MIDI format, excepted that the range is reduced to 0-63.
+	uint16_t GetRunningTime() const { return _running_time; }	/// < defines the length of time the note has to be played. The note will sound during RUNNING_TIME x RTB x ATB (in µS).
+
+private:
+	uint8_t _channel{};
+	uint8_t _note_number{};
+	uint8_t _velocity{};
+	uint16_t _running_time{};
+};
+
+class MSEQCmdSystem : public MSEQCmd {
+public:
+	MSEQCmdSystem(uint16_t first_word)
+		: MSEQCmd(MSEQ_SYSTEM_COMMAND)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_SYSTEM_COMMAND) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_SYSTEM_COMMAND);
+			_ASSERT(true);
+		}
+
+		_type = (uint16_t)(first_word & 0x00E0) >> 5;
+		_value = (uint16_t)(first_word & 0xff00) >> 8;
+	}
+
+	void Dump() const {
+		printf("[DBG] CMD System, type %d, value %d\n", _type, _value);
+	}
+
+	uint8_t GetType() const { return _type; }		/// < specifies which SYSTEM command is to be applied
+	uint16_t GetValue() const { return _value; }	/// < parameter, depends on the command TYPE.
+private:
+	uint8_t _type{};
+	uint16_t _value{};
+};
+
+class MSEQCmdDelay : public MSEQCmd {
+public:
+	MSEQCmdDelay(uint16_t first_word)
+		: MSEQCmd(MSEQ_DELAY_DELTA_TIME)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_DELAY_DELTA_TIME) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_DELAY_DELTA_TIME);
+			_ASSERT(true);
+		}
+
+		_wait = (uint16_t)(first_word & 0xFFE0) >> 5;
+	}
+
+	void Dump() const {
+		printf("[DBG] CMD Delay, wait %d\n", _wait);
+	}
+
+	uint16_t GetWait() const { return _wait; }	/// < time length to wait. This time is always based on ATB. Thus, the total delay is WAIT_DELAY x ATB (in µS). Value 0 is prohibited.
+private:
+	uint16_t _wait{};
+};
+
+class MSEQCmdRTB : public MSEQCmd {
+public:
+	MSEQCmdRTB(uint16_t first_word)
+		: MSEQCmd(MSEQ_RELATIVE_TIME_BASE_DEFINITION)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_RELATIVE_TIME_BASE_DEFINITION) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_RELATIVE_TIME_BASE_DEFINITION);
+			_ASSERT(true);
+		}
+
+		_value = (uint16_t)(first_word & 0xFFE0) >> 5;
+	}
+
+	void Dump() const {
+		printf("[DBG] CMD RTB, value %d\n", _value);
+	}
+
+	uint16_t GetValue() const { return _value; }	/// < New value for Relative Time Base. Value 0 is prohibited.
+private:
+	uint16_t _value{};
+};
+
+class MSEQCmdPrgChange: public MSEQCmd {
+public:
+	MSEQCmdPrgChange(uint16_t first_word)
+		: MSEQCmd(MSEQ_PROGRAM_CHANGE)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_PROGRAM_CHANGE) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_PROGRAM_CHANGE);
+			_ASSERT(true);
+		}
+
+		_channel = (uint16_t)(first_word & 0x01E0) >> 5;
+		_ambience = (uint16_t)(first_word & 0x0E00) >> 9;
+		_instrument_number = (uint16_t)(first_word & 0xF000) >> 12;
+	}
+
+	void Dump() const {
+		printf("[DBG] CMD PrgChange, channel %d, ambience %d, instrument number %d\n", _channel, _ambience, _instrument_number);
+	}
+
+	uint8_t GetChannel() const { return _channel; }						/// < sound channel, from 0 to 15. Most of the time, a single instrument is associated with a channel number. The definition is the same than in MIDI format.
+	uint8_t GetAmbience() const { return _ambience; }					/// < sound variation, from 0 to 7 (see Figure 39). VARIATION=7 sets a proprietary kind of sound. So if requested, it could result in an strange variation on other platforms.
+	uint8_t GetInstrumentNumber() const { return _instrument_number; }	/// < instrument number to be associated to this channel. values 0 to 15 are possible and must respect the Figure 38 definitions (to be GM compatible).
+private:
+	uint8_t _channel{};
+	uint8_t _ambience{};
+	uint8_t _instrument_number{};
+};
+
+class MSEQCmdVolume : public MSEQCmd {
+public:
+	MSEQCmdVolume(uint16_t first_word)
+		: MSEQCmd(MSEQ_PROGRAM_CHANGE)
+	{
+		MSEQ_Command_Set cmd = GetCmdFromFirstWord(first_word);
+		if (cmd != MSEQ_VOLUME) {
+			printf("[ERROR] header not matching (read as 0x%x, expected 0x%x)\n", cmd, MSEQ_VOLUME);
+			_ASSERT(true);
+		}
+
+		_channel = (uint16_t)(first_word & 0x01E0) >> 5;
+		_volume = (uint16_t)(first_word & 0xFE00) >> 9;
+	}
+
+	void Dump() const {
+		printf("[DBG] CMD Volume, channel %d, volume %d\n", _channel, _volume);
+	}
+
+	uint8_t GetChannel() const { return _channel; }		/// < sound channel, from 0 to 15. The definition is the same than in MIDI format.
+	uint16_t GetVolume() const { return _volume; }		/// < ???
+private:
+	uint8_t _channel{};
+	uint16_t _volume{};
+};
+
+class MSEQCmdFactory {
+public:
+	static MSEQCmd* ConstructFromStream(ifstream& stream)
+	{
+		uint16_t first_word = 0;
+		stream.read((char*)&first_word, sizeof(first_word));
+
+		MSEQCmd* cmd = nullptr;
+
+		switch (MSEQCmd::GetCmdFromFirstWord(first_word))
+		{
+		case MSEQ_NOTE:
+		{
+			cmd = new MSEQCmdNote(first_word);
+			break;
+		} // MSEQ_NOTE
+		case MSEQ_DELAY_DELTA_TIME:
+		{
+			cmd = new MSEQCmdDelay(first_word);
+			break;
+		} // MSEQ_DELAY_DELTA_TIME
+		case MSEQ_SYSTEM_COMMAND:
+		{
+			cmd = new MSEQCmdSystem(first_word);
+			break;
+		} // MSEQ_SYSTEM_COMMAND
+		case MSEQ_TRACK_DEFINITION:
+		{
+			cmd = new MSEQCmdTrackDefinition(first_word);
+			break;
+		} // MSEQ_TRACK_DEFINITION
+		case MSEQ_RELATIVE_TIME_BASE_DEFINITION:
+		{
+			cmd = new MSEQCmdRTB(first_word);
+			break;
+		} // MSEQ_RELATIVE_TIME_BASE_DEFINITION
+		case MSEQ_PROGRAM_CHANGE:
+		{
+			cmd = new MSEQCmdPrgChange(first_word);
+			break;
+		} // MSEQ_PROGRAM_CHANGE
+		case MSEQ_VOLUME:
+		{
+			cmd = new MSEQCmdVolume(first_word);
+			break;
+		} // MSEQ_VOLUME
+
+		default:
+		{
+			printf("[ERR] unhandled command 0x%x\n", first_word);
+			return nullptr;
+		}
+		}
+
+		if (!cmd) { return cmd; }
+		if (!cmd->IsFull()) {
+			void* mem = malloc(cmd->GetRemainingSize());
+			stream.read((char*)mem, cmd->GetRemainingSize());
+			cmd->FeedRemaining(mem, cmd->GetRemainingSize());
+			free(mem);
+		}
+		
+		cmd->Dump();
+
+		return cmd;
+	}
+};
 
 int ProcessSeq(const char* seq, const char* mid)
 {
@@ -515,18 +816,45 @@ int ProcessSeq(const char* seq, const char* mid)
 	bool track_open = false;
 	uint32_t track_length = 0;
 
+	// ATB = g_tempo / base_tempo_MIDI;
+	// g_tempo = 500000
+	uint32_t RTB = 1;
 	while (1) {
-		MSEQ_Command_or_something gen_command{};
-		infile.read((char*)&gen_command, sizeof(gen_command));
+		auto cmd = MSEQCmdFactory::ConstructFromStream(infile);
+
+		if (!cmd) {
+			printf("[ERR] unhandled no cmd\n");
+			break;
+		}
+		if (cmd->GetKind() == MSEQ_SYSTEM_COMMAND) {
+			auto cmd_as_system = reinterpret_cast<MSEQCmdSystem*>(cmd);
+			if (cmd_as_system->GetType() == CMD_SYSTEM_TYPE_EOF) {
+				printf("[INFO] End of file!\n");
+				break;
+			}
+		}
+		else if (cmd->GetKind() == MSEQ_RELATIVE_TIME_BASE_DEFINITION) {
+			auto cmd_as_rtb = reinterpret_cast<MSEQCmdRTB*>(cmd);
+			RTB = cmd_as_rtb->GetValue();
+		}
+	}
+#if 0
+
+	while (1) {
+		uint16_t a_word{};
+
+		infile.read((char*)&a_word, sizeof(a_word));
+
+
+		MSEQ_Command_or_something gen_command; gen_command.word = a_word;
 
 		switch (gen_command.cmd) {
 		case MSEQ_TRACK_DEFINITION:
 		{
 			MSEQ_Track_Header track_header{};
-			track_header.track_oc_copy_status = gen_command.lsb;
-			track_header.track_number = gen_command.msb;
+			track_header.first_word = a_word;
 
-			infile.read((char*)&track_header.track_type_subtype, sizeof(track_header) - sizeof(gen_command));
+			infile.read((char*)&track_header.track_type_subtype, sizeof(track_header) - sizeof(a_word));
 
 			if (track_open) {
 				printf("[ERR] opening a new track when one is already open!\n");
@@ -553,23 +881,24 @@ int ProcessSeq(const char* seq, const char* mid)
 			*/
 			break;
 		} // MSEQ_TRACK_DEFINITION
-		case MSEQ_RELATIVE_TIME_BASE_DEFINITION:
+
+		case MSEQ_NOTE:
 		{
-			MSEQ_Command_RelativeTimeBase rtb{};
-			rtb.first_word = gen_command.word;
+			MSEQ_Command_Note note{};
+			note.first_word = a_word;
 
-			infile.read((char*)&rtb.second_word, sizeof(rtb) - sizeof(gen_command));
+			infile.read((char*)&note.second_word, 2);
 
-			printf("[DBG] CMD RTB, note %d, channel %d, velocity %d, running time %d\n", rtb.note_number, rtb.channel, rtb.velocity, rtb.running_time);
+			printf("[DBG] CMD NOTE, note %d, channel %d, velocity %d, running time %d\n", note.note_number, note.channel, note.velocity, note.running_time);
 			break;
-		} // MSEQ_RELATIVE_TIME_BASE_DEFINITION
+		} // MSEQ_NOTE
 		default:
 			printf("[ERR] unhandled command %d\n", gen_command.cmd);
 			return -2;
 		}
 	}
 
-
+#endif
 
 
 
