@@ -1,6 +1,7 @@
 ﻿// ExtractAlcatelStuff.cpp: define el punto de entrada de la aplicación.
 //
 
+#include "MidiFile.h"
 #include "ExtractAlcatelStuff.h"
 
 using namespace std;
@@ -762,11 +763,7 @@ int ProcessSeq(const char* seq, const char* mid)
 	std::ifstream infile(seq, std::ios::binary);
 	if (!infile) return -1;
 
-	std::ofstream outfile(mid, std::ios::binary | std::ios::trunc);
-	if (!outfile) return -1;
-
 	MSEQ_Header hdr{ };
-
 
 	infile.read((char*)&hdr, sizeof(hdr));
 
@@ -812,12 +809,23 @@ int ProcessSeq(const char* seq, const char* mid)
 		hdr.loop_point2, hdr.loop_def2, hdr.start_point2, hdr.start_nb_repeat2);*/
 
 
-
-	bool track_open = false;
-	uint32_t track_length = 0;
+	smf::MidiFile outputfile;        // create an empty MIDI file with one track
+	outputfile.absoluteTicks();  // time information stored as absolute time
+	// (will be coverted to delta time when written)
+	outputfile.addTrack(15);     // Add another two tracks to the MIDI file
+	vector<smf::uchar> midievent;     // temporary storage for MIDI events
+	midievent.resize(3);        // set the size of the array to 3 bytes
+	int tpq = 500000 / AbsoluteTimeBase;              // default value in MIDI file is 48
+	outputfile.setTicksPerQuarterNote(tpq);
 
 	// ATB = g_tempo / base_tempo_MIDI;
 	// g_tempo = 500000
+
+
+	// DELAY commands use the ATB time base.
+	// NOTE commands use the (RTB x ATB) time base. This time base is in fact the biggest divider of all NOTE lengths.
+
+	uint32_t accumulated_ticks[16] = { 0 };
 	uint32_t RTB = 1;
 	while (1) {
 		auto cmd = MSEQCmdFactory::ConstructFromStream(infile);
@@ -830,85 +838,60 @@ int ProcessSeq(const char* seq, const char* mid)
 			auto cmd_as_system = reinterpret_cast<MSEQCmdSystem*>(cmd);
 			if (cmd_as_system->GetType() == CMD_SYSTEM_TYPE_EOF) {
 				printf("[INFO] End of file!\n");
+				outputfile.sortTracks();         // make sure data is in correct order
+				outputfile.write(mid);
 				break;
 			}
 		}
 		else if (cmd->GetKind() == MSEQ_RELATIVE_TIME_BASE_DEFINITION) {
 			auto cmd_as_rtb = reinterpret_cast<MSEQCmdRTB*>(cmd);
+
+			// set the RTB
 			RTB = cmd_as_rtb->GetValue();
 		}
-	}
-#if 0
-
-	while (1) {
-		uint16_t a_word{};
-
-		infile.read((char*)&a_word, sizeof(a_word));
-
-
-		MSEQ_Command_or_something gen_command; gen_command.word = a_word;
-
-		switch (gen_command.cmd) {
-		case MSEQ_TRACK_DEFINITION:
-		{
-			MSEQ_Track_Header track_header{};
-			track_header.first_word = a_word;
-
-			infile.read((char*)&track_header.track_type_subtype, sizeof(track_header) - sizeof(a_word));
-
-			if (track_open) {
-				printf("[ERR] opening a new track when one is already open!\n");
-				return -2;
+		else if (cmd->GetKind() == MSEQ_DELAY_DELTA_TIME) {
+			auto cmd_as_delay = reinterpret_cast<MSEQCmdDelay*>(cmd);
+			for (int c = 0; c < 16; c++) {
+				// add the ATB-relative delays to all channels
+				accumulated_ticks[c] += cmd_as_delay->GetWait();
 			}
+		}
+		else if (cmd->GetKind() == MSEQ_PROGRAM_CHANGE) {
+			auto cmd_as_prg = reinterpret_cast<MSEQCmdPrgChange*>(cmd);
 
-			track_length = track_header.track_length_msb;
-			track_length <<= 8;
-			track_length |= track_header.track_length_lsb;
+			// MSEQ uses a 0-15 instrument range, but MIDI uses 0-127. MSEQ also uses "ambience"
+			// modifiers for the instruments, so I'm just adding that value to the 8*(0-15) range
+			outputfile.addPatchChange(
+				cmd_as_prg->GetChannel() + 1,
+				accumulated_ticks[cmd_as_prg->GetChannel()],	// ticks are relative to ATB
+				cmd_as_prg->GetChannel(),			// per spec, MSEQ and MIDI channels match
+				(cmd_as_prg->GetInstrumentNumber() * 8) + cmd_as_prg->GetAmbience());
+		}
+		else if (cmd->GetKind() == MSEQ_NOTE) {
+			auto cmd_as_note = reinterpret_cast<MSEQCmdNote*>(cmd);
 
-			printf("[DBG] cmd 0x%x, O/C %d, copy status %d, track number %d\n",
-				track_header.track, track_header.oc, track_header.track_copy_status, track_header.track_number);
-			printf("[DBG] Track sub type %d, Length of track %d word(s)\n", track_header.track_sub_type, track_length);
+			// add a note ON (using channel + 1 as the midi track)
+			outputfile.addNoteOn(
+				cmd_as_note->GetChannel() + 1,
+				accumulated_ticks[cmd_as_note->GetChannel()],	// ticks are relative to ATB
+				cmd_as_note->GetChannel(),			// per spec, MSEQ and MIDI channels match
+				cmd_as_note->GetNoteNumber(),		// per spec, MSEQ and MIDI notes match
+				cmd_as_note->GetVelocity() << 1);	// MSEQ uses 0-63, MIDI uses 0-127, so left shift 1 time
+			
+			// add the appropriate "running time" into the accumulated ticks for this channel
+			accumulated_ticks[cmd_as_note->GetChannel()] += cmd_as_note->GetRunningTime() * RTB;
 
-
-			/*for (size_t seq_num = 0; seq_num < track_length; seq_num++) {
-				MSEQ_Command_or_something cmd{};
-				infile.read((char*)&cmd, sizeof(cmd));
-				printf("[DBG] cmd seq_num %d, kind %d\n", seq_num, cmd.cmd);
-			}
-
-			MSEQ_Track_End track_end{};
-			infile.read((char*)&track_header, sizeof(track_header));
-			*/
-			break;
-		} // MSEQ_TRACK_DEFINITION
-
-		case MSEQ_NOTE:
-		{
-			MSEQ_Command_Note note{};
-			note.first_word = a_word;
-
-			infile.read((char*)&note.second_word, 2);
-
-			printf("[DBG] CMD NOTE, note %d, channel %d, velocity %d, running time %d\n", note.note_number, note.channel, note.velocity, note.running_time);
-			break;
-		} // MSEQ_NOTE
-		default:
-			printf("[ERR] unhandled command %d\n", gen_command.cmd);
-			return -2;
+			// now add a note OFF
+			outputfile.addNoteOff(
+				cmd_as_note->GetChannel() + 1,
+				accumulated_ticks[cmd_as_note->GetChannel()],	// ticks are relative to ATB
+				cmd_as_note->GetChannel(),			// per spec, MSEQ and MIDI channels match
+				cmd_as_note->GetNoteNumber(),		// per spec, MSEQ and MIDI notes match
+				cmd_as_note->GetVelocity() << 1);	// MSEQ uses 0-63, MIDI uses 0-127, so left shift 1 time
 		}
 	}
 
-#endif
-
-
-
-	/*
-
-	*/
-
-
 	infile.close();
-	outfile.close();
 
 	return 0;
 }
@@ -935,10 +918,10 @@ int main()
 		}
 		else if (!extension.compare(".seq")) {
 			std::string outname = entry.path().filename().replace_extension().string() + ".mid";
-			//if (filesystem::exists(outname)) {
-			//	std::cout << "[INFO] NOT going to process: " << entry.path() << " (" << outname << " already exists!)" << std::endl;
-			//	continue;
-			//}
+			/*if (filesystem::exists(outname)) {
+				std::cout << "[INFO] NOT going to process: " << entry.path() << " (" << outname << " already exists!)" << std::endl;
+				continue;
+			}*/
 			std::cout << "[INFO] going to process: " << entry.path() << " (into " << outname << ")" << std::endl;
 			ProcessSeq(entry.path().string().c_str(), outname.c_str());
 		}
